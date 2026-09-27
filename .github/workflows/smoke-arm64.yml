@@ -1,0 +1,103 @@
+name: Apple Silicon smoke test
+
+# Proves what a person with an Apple Silicon Mac would see in the first
+# minute: the DMG mounts, the app is signed and notarized for arm64, every
+# native module is arm64, the app launches, its node answers, and the first
+# screen renders. It cannot sign in, pair, index or pay — that is a person's
+# test. Each run spends a few macOS runner minutes, so it is manual.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version to test (a draft is fine)
+        required: true
+        default: "0.2.1"
+
+permissions:
+  contents: write   # draft releases are only visible with push access
+
+jobs:
+  smoke:
+    runs-on: macos-15   # Apple Silicon runner
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      V: ${{ inputs.version }}
+    steps:
+      - name: Runner
+        run: |
+          uname -m
+          sw_vers
+
+      - name: Download the Apple Silicon DMG and checksums from the release
+        run: |
+          gh release download "v$V" --repo "$GITHUB_REPOSITORY" -D dl \
+            --pattern "Panscia-$V-arm64.dmg" --pattern "SHA256SUMS-$V.txt"
+          ls -l dl
+
+      - name: Checksum
+        run: |
+          cd dl
+          grep "Panscia-$V-arm64.dmg" "SHA256SUMS-$V.txt" | shasum -a 256 -c -
+
+      - name: Mount the DMG and copy the app out
+        run: |
+          hdiutil attach "dl/Panscia-$V-arm64.dmg" -nobrowse -mountpoint /tmp/panscia-dmg
+          cp -R /tmp/panscia-dmg/Panscia.app "$RUNNER_TEMP/Panscia.app"
+          hdiutil detach /tmp/panscia-dmg
+
+      - name: Architecture, signature, notarization
+        run: |
+          APP="$RUNNER_TEMP/Panscia.app"
+          file "$APP/Contents/MacOS/Panscia" | tee /dev/stderr | grep -q arm64
+          spctl -a -t exec -vv "$APP" 2>&1 | tee /dev/stderr | grep -q "Notarized Developer ID"
+          xcrun stapler validate "$APP"
+          bad=0
+          while IFS= read -r f; do
+            if ! file "$f" | grep -q arm64; then echo "not arm64: $f"; bad=1; fi
+          done < <(find "$APP/Contents" -name "*.node")
+          echo "native modules checked: $(find "$APP/Contents" -name '*.node' | wc -l | tr -d ' ')"
+          [ "$bad" = 0 ]
+
+      - name: Launch and wait for the node to answer
+        run: |
+          APP="$RUNNER_TEMP/Panscia.app"
+          export PANSCIA_USER_DATA="$RUNNER_TEMP/userdata"
+          mkdir -p "$PANSCIA_USER_DATA"
+          "$APP/Contents/MacOS/Panscia" > "$RUNNER_TEMP/app.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/app.pid"
+          for i in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:3001/health > "$RUNNER_TEMP/health.json"; then
+              echo "node answered after ${i}s:"; cat "$RUNNER_TEMP/health.json"; echo; exit 0
+            fi
+            if ! kill -0 "$(cat "$RUNNER_TEMP/app.pid")" 2>/dev/null; then
+              echo "app exited early"; cat "$RUNNER_TEMP/app.log"; exit 1
+            fi
+            sleep 1
+          done
+          echo "no answer from the node after 90s"; cat "$RUNNER_TEMP/app.log"; exit 1
+
+      - name: Screenshot the first screen
+        run: |
+          sleep 8
+          screencapture -x "$RUNNER_TEMP/first-screen.png" || echo "screencapture failed"
+          ls -l "$RUNNER_TEMP"/first-screen.png || true
+
+      - name: Quit
+        if: always()
+        run: |
+          kill "$(cat "$RUNNER_TEMP/app.pid")" 2>/dev/null || true
+          sleep 3
+          echo "== app log"; cat "$RUNNER_TEMP/app.log" || true
+
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-arm64-${{ inputs.version }}
+          path: |
+            ${{ runner.temp }}/first-screen.png
+            ${{ runner.temp }}/app.log
+            ${{ runner.temp }}/health.json
+          if-no-files-found: warn
